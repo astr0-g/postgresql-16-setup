@@ -1316,6 +1316,10 @@ log "SSL certificates verified. Starting PostgreSQL with SSL configuration..."
 log "Creating optimized SSL configuration..."
 cp /etc/postgresql/${PG_VERSION}/main/postgresql.conf /etc/postgresql/${PG_VERSION}/main/postgresql.conf.backup
 
+# Detect architecture for SSL configuration
+ARCH=$(uname -m)
+log "Configuring PostgreSQL SSL for architecture: $ARCH"
+
 cat > /etc/postgresql/${PG_VERSION}/main/postgresql.conf << EOF
 # PostgreSQL Production Configuration with SSL
 listen_addresses = '*'
@@ -1331,7 +1335,11 @@ ident_file = '/etc/postgresql/${PG_VERSION}/main/pg_ident.conf'
 ssl = on
 ssl_cert_file = '/var/lib/postgresql/${PG_VERSION}/main/ssl/server.crt'
 ssl_key_file = '/var/lib/postgresql/${PG_VERSION}/main/ssl/server.key'
+ssl_ciphers = 'HIGH:MEDIUM:+3DES:!aNULL'
 ssl_prefer_server_ciphers = on
+ssl_ecdh_curve = 'prime256v1'
+ssl_min_protocol_version = 'TLSv1.2'
+ssl_max_protocol_version = 'TLSv1.3'
 
 # Memory settings
 shared_buffers = 256MB
@@ -1360,49 +1368,194 @@ log "SSL configuration created successfully"
 # Now restart PostgreSQL with the working configuration
 log "Restarting PostgreSQL with SSL configuration..."
 
-# Stop everything first
+# Stop everything first - Enhanced cleanup
+log "Performing thorough PostgreSQL process cleanup..."
 systemctl stop postgresql 2>/dev/null || true
+systemctl stop postgresql@${PG_VERSION}-main 2>/dev/null || true
+sleep 2
+
+# Kill any remaining postgres processes
 pkill -f postgres 2>/dev/null || true
+pkill -f postmaster 2>/dev/null || true
+sleep 2
+
+# Force kill if still running
+pkill -9 -f postgres 2>/dev/null || true
+pkill -9 -f postmaster 2>/dev/null || true
+sleep 1
+
+# Remove any stale lock files and sockets
+rm -f /var/lib/postgresql/${PG_VERSION}/main/postmaster.pid 2>/dev/null || true
+rm -f /var/lib/postgresql/${PG_VERSION}/main/postmaster.opts 2>/dev/null || true
+rm -f /tmp/.s.PGSQL.5432* 2>/dev/null || true
+rm -f /var/run/postgresql/.s.PGSQL.5432* 2>/dev/null || true
+
+# Verify cleanup
+if pgrep -f postgres > /dev/null; then
+    warning "Some PostgreSQL processes are still running:"
+    ps aux | grep postgres | grep -v grep
+    log "Attempting final cleanup..."
+    pkill -9 -f postgres 2>/dev/null || true
+    sleep 2
+    
+    # Double check
+    if pgrep -f postgres > /dev/null; then
+        error "Failed to stop all PostgreSQL processes. Manual intervention required."
+    fi
+fi
+
+# Ensure SSL certificate permissions are correct
+log "Verifying SSL certificate permissions..."
+if [[ -f "/var/lib/postgresql/${PG_VERSION}/main/ssl/server.key" ]]; then
+    chown postgres:postgres /var/lib/postgresql/${PG_VERSION}/main/ssl/server.key
+    chown postgres:postgres /var/lib/postgresql/${PG_VERSION}/main/ssl/server.crt
+    chmod 600 /var/lib/postgresql/${PG_VERSION}/main/ssl/server.key
+    chmod 644 /var/lib/postgresql/${PG_VERSION}/main/ssl/server.crt
+    log "SSL certificate permissions fixed"
+fi
+
+log "PostgreSQL process cleanup completed"
 sleep 3
 
-# Try to use cluster management first
-if pg_ctlcluster ${PG_VERSION} main start 2>/dev/null; then
-    log "PostgreSQL started successfully using cluster management"
-    sleep 5
-    
-    # Test connection
-    if sudo -u postgres psql -c "SELECT 1;" > /dev/null 2>&1; then
-        log "PostgreSQL cluster management working correctly"
-        CONNECTION_METHOD="default"
-        PG_PID="cluster_managed"  # Set a placeholder since we don't have a direct PID
-    else
-        log "Cluster started but not accepting connections, trying direct start..."
-        pg_ctlcluster ${PG_VERSION} main stop 2>/dev/null || true
-        
-        # Start directly
-        sudo -u postgres /usr/lib/postgresql/${PG_VERSION}/bin/postgres \
-            -D /var/lib/postgresql/${PG_VERSION}/main \
-            -c config_file=/etc/postgresql/${PG_VERSION}/main/postgresql.conf \
-            > /var/log/postgresql/postgresql-ssl-startup.log 2>&1 &
-        
-        PG_PID=$!
-        sleep 10
-        CONNECTION_METHOD="direct"
-    fi
-else
-    log "Cluster management failed, starting PostgreSQL directly..."
-    
-    # Start PostgreSQL directly
-    sudo -u postgres /usr/lib/postgresql/${PG_VERSION}/bin/postgres \
-        -D /var/lib/postgresql/${PG_VERSION}/main \
-        -c config_file=/etc/postgresql/${PG_VERSION}/main/postgresql.conf \
-        > /var/log/postgresql/postgresql-ssl-startup.log 2>&1 &
-    
-    PG_PID=$!
-    log "PostgreSQL started directly with PID: $PG_PID"
-    sleep 10
-    CONNECTION_METHOD="direct"
-fi
+# Architecture-specific startup strategy
+case $ARCH in
+    x86_64)
+        log "Using x86_64 optimized startup sequence..."
+        # For x86, try systemctl first as it's more stable
+        if systemctl start postgresql 2>/dev/null; then
+            log "PostgreSQL systemctl start command executed"
+            sleep 5
+            
+            # Verify the service is actually running
+            if systemctl is-active --quiet postgresql; then
+                log "PostgreSQL service is active"
+                sleep 3
+                
+                # Check if process is actually running
+                if pgrep -f "postgres.*main" > /dev/null; then
+                    log "PostgreSQL process confirmed running"
+                    CONNECTION_METHOD="systemctl"
+                    PG_PID="systemctl_managed"
+                else
+                    warning "PostgreSQL service active but no process found, checking logs..."
+                    if [[ -f "/var/log/postgresql/postgresql-16-main.log" ]]; then
+                        log "Recent PostgreSQL log entries:"
+                        tail -10 /var/log/postgresql/postgresql-16-main.log
+                    fi
+                    systemctl stop postgresql 2>/dev/null || true
+                    CONNECTION_METHOD="failed_systemctl"
+                fi
+            else
+                warning "PostgreSQL service failed to start properly"
+                CONNECTION_METHOD="failed_systemctl"
+            fi
+            
+            # Test connection only if service is confirmed running
+            if [[ "$CONNECTION_METHOD" == "systemctl" ]] && ! sudo -u postgres psql -c "SELECT 1;" > /dev/null 2>&1; then
+                log "Systemctl start succeeded but connection failed, trying cluster management..."
+                systemctl stop postgresql 2>/dev/null || true
+                sleep 3
+                
+                if pg_ctlcluster ${PG_VERSION} main start 2>/dev/null; then
+                    log "PostgreSQL started using cluster management"
+                    sleep 5
+                    CONNECTION_METHOD="cluster"
+                    PG_PID="cluster_managed"
+                else
+                    log "Cluster management failed, trying direct start..."
+                    # Start directly for x86
+                    sudo -u postgres /usr/lib/postgresql/${PG_VERSION}/bin/postgres \
+                        -D /var/lib/postgresql/${PG_VERSION}/main \
+                        -c config_file=/etc/postgresql/${PG_VERSION}/main/postgresql.conf \
+                        > /var/log/postgresql/postgresql-ssl-startup.log 2>&1 &
+                    
+                    PG_PID=$!
+                    sleep 12
+                    CONNECTION_METHOD="direct"
+                fi
+            fi
+        elif [[ "$CONNECTION_METHOD" == "failed_systemctl" ]]; then
+            log "Systemctl failed, falling back to cluster management..."
+            if pg_ctlcluster ${PG_VERSION} main start 2>/dev/null; then
+                log "PostgreSQL started using cluster management"
+                sleep 5
+                CONNECTION_METHOD="cluster"
+                PG_PID="cluster_managed"
+            else
+                log "Cluster management also failed, starting directly..."
+                sudo -u postgres /usr/lib/postgresql/${PG_VERSION}/bin/postgres \
+                    -D /var/lib/postgresql/${PG_VERSION}/main \
+                    -c config_file=/etc/postgresql/${PG_VERSION}/main/postgresql.conf \
+                    > /var/log/postgresql/postgresql-ssl-startup.log 2>&1 &
+                
+                PG_PID=$!
+                sleep 12
+                CONNECTION_METHOD="direct"
+            fi
+        else
+            error "Failed to execute systemctl start postgresql"
+        fi
+        ;;
+    aarch64|arm64)
+        log "Using ARM64 optimized startup sequence..."
+        # For ARM, try cluster management first as it's proven to work
+        if pg_ctlcluster ${PG_VERSION} main start 2>/dev/null; then
+            log "PostgreSQL started successfully using cluster management"
+            sleep 5
+            CONNECTION_METHOD="cluster"
+            PG_PID="cluster_managed"
+            
+            # Test connection
+            if ! sudo -u postgres psql -c "SELECT 1;" > /dev/null 2>&1; then
+                log "Cluster started but not accepting connections, trying direct start..."
+                pg_ctlcluster ${PG_VERSION} main stop 2>/dev/null || true
+                
+                # Start directly
+                sudo -u postgres /usr/lib/postgresql/${PG_VERSION}/bin/postgres \
+                    -D /var/lib/postgresql/${PG_VERSION}/main \
+                    -c config_file=/etc/postgresql/${PG_VERSION}/main/postgresql.conf \
+                    > /var/log/postgresql/postgresql-ssl-startup.log 2>&1 &
+                
+                PG_PID=$!
+                sleep 10
+                CONNECTION_METHOD="direct"
+            fi
+        else
+            log "Cluster management failed, starting PostgreSQL directly..."
+            sudo -u postgres /usr/lib/postgresql/${PG_VERSION}/bin/postgres \
+                -D /var/lib/postgresql/${PG_VERSION}/main \
+                -c config_file=/etc/postgresql/${PG_VERSION}/main/postgresql.conf \
+                > /var/log/postgresql/postgresql-ssl-startup.log 2>&1 &
+            
+            PG_PID=$!
+            log "PostgreSQL started directly with PID: $PG_PID"
+            sleep 10
+            CONNECTION_METHOD="direct"
+        fi
+        ;;
+    *)
+        warning "Unknown architecture: $ARCH, using default startup method..."
+        # Default method - try cluster first
+        if pg_ctlcluster ${PG_VERSION} main start 2>/dev/null; then
+            log "PostgreSQL started using cluster management"
+            sleep 5
+            CONNECTION_METHOD="cluster"
+            PG_PID="cluster_managed"
+        else
+            log "Starting PostgreSQL directly..."
+            sudo -u postgres /usr/lib/postgresql/${PG_VERSION}/bin/postgres \
+                -D /var/lib/postgresql/${PG_VERSION}/main \
+                -c config_file=/etc/postgresql/${PG_VERSION}/main/postgresql.conf \
+                > /var/log/postgresql/postgresql-ssl-startup.log 2>&1 &
+            
+            PG_PID=$!
+            sleep 10
+            CONNECTION_METHOD="direct"
+        fi
+        ;;
+esac
+
+log "PostgreSQL startup attempted using method: $CONNECTION_METHOD"
 
 # Wait for PostgreSQL to be ready and verify SSL works
 log "Waiting for PostgreSQL to be ready and testing SSL..."
@@ -1415,7 +1568,30 @@ CONNECTION_WORKING=false
 SSL_WORKING=false
 
 # Check if PostgreSQL process is still running
-if [[ -n "$PG_PID" ]] && [[ "$PG_PID" == "cluster_managed" ]]; then
+# First, let's check if PostgreSQL is actually running regardless of how it was started
+POSTGRES_PROCESSES=$(pgrep -f "postgres.*main" | wc -l)
+if [[ $POSTGRES_PROCESSES -gt 0 ]]; then
+    log "Found $POSTGRES_PROCESSES PostgreSQL processes running"
+    
+    # Test connection immediately since PostgreSQL is running
+    if sudo -u postgres psql -c "SELECT 1;" > /dev/null 2>&1; then
+        log "✅ PostgreSQL connection successful"
+        CONNECTION_METHOD="default"
+        CONNECTION_WORKING=true
+    elif sudo -u postgres psql -h /var/run/postgresql -c "SELECT 1;" > /dev/null 2>&1; then
+        log "✅ PostgreSQL socket connection successful"
+        CONNECTION_METHOD="socket"
+        CONNECTION_WORKING=true
+    else
+        warning "PostgreSQL processes found but connection failed, waiting a bit more..."
+        sleep 5
+        if sudo -u postgres psql -c "SELECT 1;" > /dev/null 2>&1; then
+            log "✅ PostgreSQL connection successful after wait"
+            CONNECTION_METHOD="default"
+            CONNECTION_WORKING=true
+        fi
+    fi
+elif [[ -n "$PG_PID" ]] && [[ "$PG_PID" == "cluster_managed" ]]; then
     log "PostgreSQL is running under cluster management"
     
     # Test basic connection for cluster managed PostgreSQL
@@ -1456,18 +1632,72 @@ elif [[ -n "$PG_PID" ]] && kill -0 $PG_PID 2>/dev/null; then
         fi
     fi
 else
-    warning "PostgreSQL process has exited or was not started properly"
-    log "Checking startup logs..."
-    if [[ -f "/var/log/postgresql/postgresql-ssl-startup.log" ]]; then
-        echo "Startup log contents:"
-        cat /var/log/postgresql/postgresql-ssl-startup.log
-    fi
+    warning "Could not detect PostgreSQL process using PID method, checking alternative ways..."
     
-    # Try to start PostgreSQL one more time with foreground mode to see errors
-    log "Attempting to start PostgreSQL in foreground mode to see errors..."
-    timeout 10 sudo -u postgres /usr/lib/postgresql/16/bin/postgres \
-        -D /var/lib/postgresql/16/main \
-        -c config_file=/etc/postgresql/16/main/postgresql.conf 2>&1 | head -20
+    # Check if PostgreSQL is actually running using different methods
+    log "=== ALTERNATIVE POSTGRESQL DETECTION ==="
+    
+    # Check for any postgres processes
+    log "Checking for PostgreSQL processes..."
+    if pgrep -f postgres > /dev/null; then
+        echo "Found PostgreSQL processes:"
+        ps aux | grep postgres | grep -v grep
+        
+        log "PostgreSQL appears to be running, testing connection..."
+        if sudo -u postgres psql -c "SELECT 1;" > /dev/null 2>&1; then
+            log "✅ Connection successful! PostgreSQL is working properly."
+            CONNECTION_WORKING=true
+            CONNECTION_METHOD="recovered"
+        else
+            log "Processes found but connection failed, investigating..."
+        fi
+    else
+        echo "No PostgreSQL processes found, attempting to start..."
+        
+        # Remove any lock files
+        rm -f /var/lib/postgresql/16/main/postmaster.pid 2>/dev/null || true
+        rm -f /tmp/.s.PGSQL.5432* 2>/dev/null || true
+        
+        # Check startup logs
+        log "Checking startup logs..."
+        if [[ -f "/var/log/postgresql/postgresql-ssl-startup.log" ]]; then
+            echo "=== SSL Startup Log ==="
+            cat /var/log/postgresql/postgresql-ssl-startup.log
+            echo "======================"
+        fi
+        
+        if [[ -f "/var/log/postgresql/postgresql-16-main.log" ]]; then
+            echo "=== Main PostgreSQL Log (last 30 lines) ==="
+            tail -30 /var/log/postgresql/postgresql-16-main.log
+            echo "============================================"
+        fi
+        
+        # Check configuration syntax
+        log "Checking configuration file syntax..."
+        if sudo -u postgres /usr/lib/postgresql/16/bin/postgres -D /var/lib/postgresql/16/main --check 2>&1 | grep -q "configuration file appears to be correct"; then
+            log "✅ Configuration syntax is valid"
+        else
+            warning "Configuration syntax check completed (may have warnings)"
+            # Show the actual output for debugging
+            sudo -u postgres /usr/lib/postgresql/16/bin/postgres -D /var/lib/postgresql/16/main --check 2>&1 | head -10
+        fi
+        
+        # Check SSL certificate permissions
+        log "Checking SSL certificate permissions..."
+        if [[ -f "/var/lib/postgresql/16/main/ssl/server.key" ]]; then
+            ls -la /var/lib/postgresql/16/main/ssl/
+        else
+            warning "SSL certificate files not found"
+        fi
+        
+        # Try to start PostgreSQL one more time with foreground mode to see errors
+        log "Attempting to start PostgreSQL in foreground mode to see errors..."
+        timeout 15 sudo -u postgres /usr/lib/postgresql/16/bin/postgres \
+            -D /var/lib/postgresql/16/main \
+            -c config_file=/etc/postgresql/16/main/postgresql.conf 2>&1 | head -30
+            
+        log "=========================================="
+    fi
 fi
 
 # If basic connection works, test SSL
@@ -1525,7 +1755,10 @@ log "✅ PostgreSQL is ready with working SSL connection!"
 # Function to compile pg_stat_monitor from source
 compile_pg_stat_monitor() {
     log "Installing build dependencies for pg_stat_monitor..."
-    apt install -y build-essential git postgresql-server-dev-${PG_VERSION} libpq-dev
+    if ! apt install -y build-essential git postgresql-server-dev-${PG_VERSION} libpq-dev; then
+        warning "Failed to install build dependencies, skipping pg_stat_monitor compilation"
+        return 1
+    fi
     
     # Create temporary build directory
     BUILD_DIR="/tmp/pg_stat_monitor_build"
@@ -1540,15 +1773,85 @@ compile_pg_stat_monitor() {
         
         # Build and install
         log "Building pg_stat_monitor..."
-        if make USE_PGXS=1 && make USE_PGXS=1 install; then
-            log "pg_stat_monitor compiled and installed successfully"
-            
-            # Update shared_preload_libraries to include pg_stat_monitor
-            log "Updating PostgreSQL configuration to use pg_stat_monitor..."
-            sed -i "s/shared_preload_libraries = '[^']*'/shared_preload_libraries = 'pg_stat_monitor'/" /etc/postgresql/${PG_VERSION}/main/postgresql.conf
-            
-            # Add pg_stat_monitor configuration
-            cat >> /etc/postgresql/${PG_VERSION}/main/postgresql.conf << EOF
+        if make USE_PGXS=1 2>&1 | tee /tmp/pg_stat_monitor_build.log; then
+            if make USE_PGXS=1 install 2>&1 | tee -a /tmp/pg_stat_monitor_build.log; then
+                log "pg_stat_monitor compiled and installed successfully"
+                return 0
+            else
+                warning "pg_stat_monitor installation failed"
+                log "Build log:"
+                tail -20 /tmp/pg_stat_monitor_build.log
+                return 1
+            fi
+        else
+            warning "pg_stat_monitor compilation failed"
+            log "Build log:"
+            tail -20 /tmp/pg_stat_monitor_build.log
+            return 1
+        fi
+    else
+        warning "Failed to clone pg_stat_monitor source"
+        return 1
+    fi
+}
+
+# Install monitoring tools
+log "Installing monitoring tools..."
+
+# Install pg_stat_monitor (better than pg_stat_statements)
+log "Installing pg_stat_monitor..."
+
+# Detect architecture for pg_stat_monitor
+ARCH=$(uname -m)
+PG_STAT_MONITOR_SUCCESS=false
+
+if [[ "$ARCH" == "x86_64" ]]; then
+    log "Attempting to install pg_stat_monitor for x86_64..."
+    
+    # Try pre-compiled package first
+    if wget -q https://github.com/percona/pg_stat_monitor/releases/download/REL2_0_4/percona-pg-stat-monitor_2.0.4-1.noble_amd64.deb; then
+        if dpkg -i percona-pg-stat-monitor_2.0.4-1.noble_amd64.deb 2>/dev/null || apt-get install -f -y; then
+            log "pg_stat_monitor installed successfully from package"
+            PG_STAT_MONITOR_SUCCESS=true
+            rm -f percona-pg-stat-monitor_2.0.4-1.noble_amd64.deb
+        else
+            warning "Package installation failed, trying compilation..."
+            rm -f percona-pg-stat-monitor_2.0.4-1.noble_amd64.deb
+        fi
+    else
+        log "Package download failed, trying compilation..."
+    fi
+    
+    # If package failed, try compilation
+    if [[ "$PG_STAT_MONITOR_SUCCESS" != "true" ]]; then
+        if compile_pg_stat_monitor; then
+            PG_STAT_MONITOR_SUCCESS=true
+        else
+            warning "pg_stat_monitor compilation failed on x86_64"
+        fi
+    fi
+    
+elif [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]]; then
+    log "Compiling pg_stat_monitor from source for ARM64..."
+    if compile_pg_stat_monitor; then
+        PG_STAT_MONITOR_SUCCESS=true
+    else
+        warning "pg_stat_monitor compilation failed on ARM64"
+    fi
+else
+    warning "Unsupported architecture: $ARCH, skipping pg_stat_monitor"
+fi
+
+# Configure pg_stat_monitor if installation was successful
+if [[ "$PG_STAT_MONITOR_SUCCESS" == "true" ]]; then
+    log "Configuring pg_stat_monitor..."
+    
+    # Update shared_preload_libraries to include pg_stat_monitor
+    log "Updating PostgreSQL configuration to use pg_stat_monitor..."
+    sed -i "s/shared_preload_libraries = '[^']*'/shared_preload_libraries = 'pg_stat_monitor'/" /etc/postgresql/${PG_VERSION}/main/postgresql.conf
+    
+    # Add pg_stat_monitor configuration
+    cat >> /etc/postgresql/${PG_VERSION}/main/postgresql.conf << EOF
 
 # pg_stat_monitor settings (enhanced query statistics)
 pg_stat_monitor.pgsm_max = 10000
@@ -1557,66 +1860,57 @@ pg_stat_monitor.pgsm_normalized_query = on
 pg_stat_monitor.pgsm_enable_query_plan = on
 pg_stat_monitor.pgsm_track_planning = on
 EOF
-            
-            # Restart PostgreSQL to load the new extension
-            log "Restarting PostgreSQL to load pg_stat_monitor..."
-            pkill -f postgres 2>/dev/null || true
-            sleep 3
-            
-            # Start PostgreSQL again
-            sudo -u postgres /usr/lib/postgresql/${PG_VERSION}/bin/postgres \
-                -D /var/lib/postgresql/${PG_VERSION}/main \
-                -c config_file=/etc/postgresql/${PG_VERSION}/main/postgresql.conf \
-                > /var/log/postgresql/postgresql-direct-startup.log 2>&1 &
-            
-            PG_PID=$!
-            sleep 10
-            
-            # Test if pg_stat_monitor is available
-            if sudo -u postgres psql -c "CREATE EXTENSION IF NOT EXISTS pg_stat_monitor;" > /dev/null 2>&1; then
-                log "🎉 pg_stat_monitor extension created successfully!"
-                PG_STAT_MONITOR_AVAILABLE=true
-            else
-                warning "Failed to create pg_stat_monitor extension, falling back to pg_stat_statements"
-                sed -i "s/shared_preload_libraries = 'pg_stat_monitor'/shared_preload_libraries = 'pg_stat_statements'/" /etc/postgresql/${PG_VERSION}/main/postgresql.conf
-                PG_STAT_MONITOR_AVAILABLE=false
-            fi
-        else
-            warning "Failed to build pg_stat_monitor, using default pg_stat_statements"
-            PG_STAT_MONITOR_AVAILABLE=false
-        fi
+    
+    # Restart PostgreSQL to load the new extension
+    log "Restarting PostgreSQL to load pg_stat_monitor..."
+    
+    # Enhanced cleanup for pg_stat_monitor restart
+    systemctl stop postgresql 2>/dev/null || true
+    pkill -f postgres 2>/dev/null || true
+    pkill -f postmaster 2>/dev/null || true
+    sleep 2
+    
+    # Remove lock files
+    rm -f /var/lib/postgresql/${PG_VERSION}/main/postmaster.pid 2>/dev/null || true
+    sleep 2
+    
+    # Start PostgreSQL again using systemctl (more reliable)
+    if systemctl start postgresql 2>/dev/null; then
+        sleep 5
+        log "PostgreSQL restarted successfully with systemctl"
     else
-        warning "Failed to clone pg_stat_monitor source, using default pg_stat_statements"
-        PG_STAT_MONITOR_AVAILABLE=false
+        log "Systemctl failed, trying direct start..."
+        sudo -u postgres /usr/lib/postgresql/${PG_VERSION}/bin/postgres \
+            -D /var/lib/postgresql/${PG_VERSION}/main \
+            -c config_file=/etc/postgresql/${PG_VERSION}/main/postgresql.conf \
+            > /var/log/postgresql/postgresql-direct-startup.log 2>&1 &
+        
+        PG_PID=$!
+        sleep 10
     fi
     
-    # Clean up build directory
+    # Test if pg_stat_monitor is available
+    if sudo -u postgres psql -c "CREATE EXTENSION IF NOT EXISTS pg_stat_monitor;" > /dev/null 2>&1; then
+        log "🎉 pg_stat_monitor extension created successfully!"
+        PG_STAT_MONITOR_AVAILABLE=true
+    else
+        warning "Failed to create pg_stat_monitor extension, falling back to pg_stat_statements"
+        sed -i "s/shared_preload_libraries = 'pg_stat_monitor'/shared_preload_libraries = 'pg_stat_statements'/" /etc/postgresql/${PG_VERSION}/main/postgresql.conf
+        PG_STAT_MONITOR_AVAILABLE=false
+        
+        # Restart again with pg_stat_statements
+        systemctl restart postgresql 2>/dev/null || true
+        sleep 3
+    fi
+else
+    log "pg_stat_monitor installation failed, using default pg_stat_statements"
+    PG_STAT_MONITOR_AVAILABLE=false
+fi
+
+# Clean up build directory if function was called
+if [[ -n "$BUILD_DIR" && -d "$BUILD_DIR" ]]; then
     cd /
     rm -rf "$BUILD_DIR"
-}
-
-# Install and configure monitoring tools
-log "Installing monitoring tools..."
-
-# Install pg_stat_monitor (better than pg_stat_statements)
-log "Installing pg_stat_monitor..."
-# Detect architecture for pg_stat_monitor
-ARCH=$(uname -m)
-if [[ "$ARCH" == "x86_64" ]]; then
-    wget -q https://github.com/percona/pg_stat_monitor/releases/download/REL2_0_4/percona-pg-stat-monitor_2.0.4-1.noble_amd64.deb
-    if [[ $? -eq 0 ]]; then
-        dpkg -i percona-pg-stat-monitor_2.0.4-1.noble_amd64.deb || apt-get install -f -y
-        rm percona-pg-stat-monitor_2.0.4-1.noble_amd64.deb
-        log "pg_stat_monitor installed successfully from package"
-    else
-        warning "Failed to download pg_stat_monitor for x86_64, compiling from source..."
-        compile_pg_stat_monitor
-    fi
-elif [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]]; then
-    log "Compiling pg_stat_monitor from source for ARM64..."
-    compile_pg_stat_monitor
-else
-    warning "Unsupported architecture: $ARCH, using default pg_stat_statements"
 fi
 
 
@@ -1626,11 +1920,34 @@ apt install -y pgbadger
 
 # Install Prometheus
 log "Installing Prometheus..."
-wget -q https://github.com/prometheus/prometheus/releases/download/v2.45.0/prometheus-2.45.0.linux-arm64.tar.gz
-tar xzf prometheus-2.45.0.linux-arm64.tar.gz
-mv prometheus-2.45.0.linux-arm64/prometheus /usr/local/bin/
-mv prometheus-2.45.0.linux-arm64/promtool /usr/local/bin/
-rm -rf prometheus-2.45.0.linux-arm64*
+
+# Detect architecture for Prometheus
+ARCH=$(uname -m)
+case $ARCH in
+    x86_64)
+        PROMETHEUS_ARCH="linux-amd64"
+        ;;
+    aarch64|arm64)
+        PROMETHEUS_ARCH="linux-arm64"
+        ;;
+    *)
+        warning "Unsupported architecture: $ARCH for Prometheus, using amd64 as fallback"
+        PROMETHEUS_ARCH="linux-amd64"
+        ;;
+esac
+
+log "Downloading Prometheus for architecture: $PROMETHEUS_ARCH"
+wget -q https://github.com/prometheus/prometheus/releases/download/v2.45.0/prometheus-2.45.0.${PROMETHEUS_ARCH}.tar.gz
+
+if [[ $? -eq 0 ]]; then
+    tar xzf prometheus-2.45.0.${PROMETHEUS_ARCH}.tar.gz
+    mv prometheus-2.45.0.${PROMETHEUS_ARCH}/prometheus /usr/local/bin/
+    mv prometheus-2.45.0.${PROMETHEUS_ARCH}/promtool /usr/local/bin/
+    rm -rf prometheus-2.45.0.${PROMETHEUS_ARCH}*
+    log "Prometheus installed successfully for $PROMETHEUS_ARCH"
+else
+    error "Failed to download Prometheus for $PROMETHEUS_ARCH architecture"
+fi
 
 # Create prometheus user and directories
 if ! id prometheus &>/dev/null; then
