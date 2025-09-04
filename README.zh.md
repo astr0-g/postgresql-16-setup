@@ -9,7 +9,7 @@
 ### 一行代码部署
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/astr0-g/postgresql-16-setup/main/postgresql_production_setup.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/astr0-g/postgresql-16-setup/main/postgresql_production_setup.sh -o postgresql_setup.sh && chmod +x postgresql_setup.sh && sudo ./postgresql_setup.sh
 ```
 
 或者克隆仓库后运行：

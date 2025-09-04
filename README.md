@@ -9,7 +9,8 @@ One-click PostgreSQL 16 production deployment with SSL-encrypted connections, Le
 ### One-Line Installation
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/astr0-g/postgresql-16-setup/main/postgresql_production_setup.sh | sudo bash
+# Download and run interactively
+curl -fsSL https://raw.githubusercontent.com/astr0-g/postgresql-16-setup/main/postgresql_production_setup.sh -o postgresql_setup.sh && chmod +x postgresql_setup.sh && sudo ./postgresql_setup.sh
 ```
 
 Or clone and run locally:

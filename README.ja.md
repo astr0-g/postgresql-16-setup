@@ -9,7 +9,7 @@ SSL 暗号化接続、Let's Encrypt 証明書、Prometheus/Grafana モニタリ�
 ### ワンライン インストール
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/astr0-g/postgresql-16-setup/main/postgresql_production_setup.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/astr0-g/postgresql-16-setup/main/postgresql_production_setup.sh -o postgresql_setup.sh && chmod +x postgresql_setup.sh && sudo ./postgresql_setup.sh
 ```
 
 またはリポジトリをクローンして実行：
